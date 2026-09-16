@@ -1,0 +1,368 @@
+import asyncio
+import logging
+import sqlite3
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
+
+# Siz taqdim etgan bot tokeni
+BOT_TOKEN = "8992914368:AAH0uq5qyaJK5TJHQ_AHd-uLzF_8TC1-Sz8"
+
+# Database sozlamalari
+conn = sqlite3.connect("admin_app.db", check_same_thread=False)
+cursor = conn.cursor()
+
+# Bosh adminlar jadvali
+cursor.execute(
+    """
+CREATE TABLE IF NOT EXISTS system_admins (
+    user_id INTEGER PRIMARY KEY
+)
+"""
+)
+
+# Ariza topshiruvchilar va umumiy foydalanuvchilar jadvali
+cursor.execute(
+    """
+CREATE TABLE IF NOT EXISTS applications (
+    user_id INTEGER PRIMARY KEY,
+    full_name TEXT,
+    username TEXT,
+    step INTEGER DEFAULT 1
+)
+"""
+)
+conn.commit()
+
+
+# FSM Holatlari
+class AdminApp(StatesGroup):
+    step1 = State()
+    step2 = State()
+    final_message = State()
+
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+router = Router()
+dp.include_router(router)
+
+
+def is_system_admin(user_id: int) -> bool:
+    cursor.execute(
+        "SELECT user_id FROM system_admins WHERE user_id = ?", (user_id,)
+    )
+    return cursor.fetchone() is not None
+
+
+def get_admin_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="?? Foydalanuvchilar")]],
+        resize_keyboard=True,
+    )
+
+
+# /start buyrug'i
+@router.message(Command("start"))
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    user = message.from_user
+
+    # Bazaga foydalanuvchini saqlash
+    cursor.execute(
+        """
+        INSERT INTO applications (user_id, full_name, username, step)
+        VALUES (?, ?, ?, 1)
+        ON CONFLICT(user_id) DO UPDATE SET full_name = ?, username = ?
+    """,
+        (user.id, user.full_name, user.username, user.full_name, user.username),
+    )
+    conn.commit()
+
+    # Bosh admin bo'lsa
+    if is_system_admin(user.id):
+        await message.answer(
+            f"Salom, Bosh Admin {user.first_name}!",
+            reply_markup=get_admin_keyboard(),
+        )
+        return
+
+    # Bosh adminlarga yangi foydalanuvchi haqida xabar yuborish
+    username_str = f"@{user.username}" if user.username else "Yo'q"
+    admin_msg = (
+        f"?? <b>Yangi nomzod start bosdi:</b>\n\n"
+        f"?? Ism: {user.full_name}\n"
+        f"?? Username: {username_str}\n"
+        f"?? ID: <code>{user.id}</code>"
+    )
+
+    cursor.execute("SELECT user_id FROM system_admins")
+    sys_admins = cursor.fetchall()
+    for sys_admin in sys_admins:
+        try:
+            await bot.send_message(sys_admin[0], admin_msg, parse_mode="HTML")
+        except Exception:
+            pass
+
+    # Foydalanuvchiga salomlashish va 1-shart
+    welcome_text = (
+        f"Salom, {user.first_name}!\n\n"
+        f"Bizning kanalimiz: @FC_PROUZ\n"
+        f"Chatimiz: @FC_PROUZCHAT\n\n"
+        f"?? <b>Kanalga admin bo'lish shartlari:</b>\n"
+        f"Siz 2 ta shartni bajarishingiz kerak. Har bir shart adminlar tomonidan tekshiriladi.\n\n"
+        f"1?? <b>1-shart:</b> Bizning chatimizga (@FC_PROUZCHAT) 5 ta odam qo'shing.\n"
+        f"Odam qo'shib bo'lgach, pastdagi <b>'Oldinga ??'</b> tugmasini bosing."
+    )
+
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Oldinga ??")]], resize_keyboard=True
+    )
+    await state.set_state(AdminApp.step1)
+    await message.answer(welcome_text, reply_markup=kb, parse_mode="HTML")
+
+
+# /admin 1234 — Bosh adminlikni olish
+@router.message(Command("admin"))
+async def cmd_admin(message: Message):
+    args = message.text.split()
+    if len(args) > 1 and args[1] == "1234":
+        cursor.execute(
+            "INSERT OR IGNORE INTO system_admins (user_id) VALUES (?)",
+            (message.from_user.id,),
+        )
+        conn.commit()
+        await message.answer(
+            "?? Siz botda Bosh Admin sifatida ro'yxatdan o'tdingiz!",
+            reply_markup=get_admin_keyboard(),
+        )
+    else:
+        await message.answer("? Noto'g'ri parol!")
+
+
+# ?? Foydalanuvchilar menyusi (Faqat Bosh admin uchun)
+@router.message(F.text == "?? Foydalanuvchilar")
+async def show_users_list(message: Message):
+    if not is_system_admin(message.from_user.id):
+        return
+
+    cursor.execute("SELECT user_id, full_name, username FROM applications")
+    users = cursor.fetchall()
+
+    if not users:
+        await message.answer("Botda hali hech kim ro'yxatdan o'tmagan.")
+        return
+
+    text = f"?? <b>Botdagi barcha foydalanuvchilar ({len(users)} ta):</b>\n\n"
+    for idx, u in enumerate(users, start=1):
+        username_str = f"@{u[2]}" if u[2] else "Username yo'q"
+        text += f"{idx}. <b>{u[1]}</b> | {username_str}\n?? ID: <code>{u[0]}</code>\n---\n"
+
+    await message.answer(text, parse_mode="HTML")
+
+
+# ADMIN REPLY: /send <matn> orqali xabar yuborish
+@router.message(F.reply_to_message, F.text.startswith("/send"))
+async def send_custom_message(message: Message):
+    if not is_system_admin(message.from_user.id):
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("?? Iltimos, yubormoqchi bo'lgan matningizni kiriting.\nMasalan: <code>/send Salom!</code>", parse_mode="HTML")
+        return
+
+    text_to_send = parts[1]
+    reply_text = message.reply_to_message.text or ""
+
+    target_id = None
+    if "ID:" in reply_text or "ID: " in reply_text:
+        try:
+            target_id = int(reply_text.split("ID:")[1].split()[0].replace("</code>", "").strip())
+        except Exception:
+            target_id = None
+
+    if target_id:
+        try:
+            await bot.send_message(
+                target_id,
+                f"?? <b>Admindan xabar:</b>\n\n{text_to_send}",
+                parse_mode="HTML"
+            )
+            await message.answer("? Xabar foydalanuvchiga muvaffaqiyatli yuborildi!")
+        except Exception as e:
+            await message.answer(f"? Xabar yuborishda xatolik yuz berdi: {e}")
+    else:
+        await message.answer("?? ID topilmadi. Javob bering (reply qiling) va xabarda ID raqami borligiga ishonch hosil qiling.")
+
+
+# 1-shart: "Oldinga ??" tugmasi bosilganda
+@router.message(AdminApp.step1, F.text == "Oldinga ??")
+async def process_step1(message: Message):
+    user = message.from_user
+    await message.answer(
+        "Sizning 1-shart bo'yicha so'rovingiz adminga yuborildi. Tekshirilishini kuting...",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+    cursor.execute("SELECT user_id FROM system_admins")
+    sys_admins = cursor.fetchall()
+    msg_to_admin = (
+        f"?? <b>1-shartni tekshirish:</b>\n"
+        f"Foydalanuvchi: {user.full_name}\n"
+        f"?? ID: <code>{user.id}</code>\n"
+        f"Chatga 5 ta odam qo'shganini tekshiring.\n\n"
+        f"<i>Tasdiqlash uchun ushbu xabarga reply qilib <code>/aniq</code>, rad etish uchun <code>/aniqmas</code> deb yozing.</i>"
+    )
+
+    for sys_admin in sys_admins:
+        try:
+            await bot.send_message(sys_admin[0], msg_to_admin, parse_mode="HTML")
+        except Exception:
+            pass
+
+
+# ADMIN REPLY: /aniq
+@router.message(F.reply_to_message, F.text == "/aniq")
+async def admin_confirm(message: Message):
+    if not is_system_admin(message.from_user.id):
+        return
+
+    reply_text = message.reply_to_message.text or ""
+    if "ID:" in reply_text:
+        try:
+            target_id = int(reply_text.split("ID:")[1].split()[0].replace("</code>", "").strip())
+
+            cursor.execute(
+                "SELECT step FROM applications WHERE user_id = ?", (target_id,)
+            )
+            res = cursor.fetchone()
+
+            if res and res[0] == 1:
+                cursor.execute(
+                    "UPDATE applications SET step = 2 WHERE user_id = ?",
+                    (target_id,),
+                )
+                conn.commit()
+
+                step2_text = (
+                    "? 1-shart tasdiqlandi!\n\n"
+                    "2?? <b>2-shart:</b> Siz @nazorat1091_bot botiga qo'shilishingiz kerak.\n\n"
+                    "? <b>Nima uchun?</b>\n"
+                    "Ushbu kanalda siz admin bo'lganingizdan keyin 24 soat ichida 1 ta ham "
+                    "ma'lumot tashlamasangiz, sizga ogohlantirish boradi bot tomonidan. "
+                    "Agar 3 marta ogohlantirish olsangiz, kanaldagi adminlik huquqlaringiz olib tashlanadi.\n\n"
+                    "Botga qo'shilib bo'lgach, pastdagi <b>'2-shartni bajardim ??'</b> tugmasini bosing."
+                )
+
+                kb = ReplyKeyboardMarkup(
+                    keyboard=[[KeyboardButton(text="2-shartni bajardim ??")]],
+                    resize_keyboard=True,
+                )
+
+                await bot.send_message(
+                    target_id, step2_text, reply_markup=kb, parse_mode="HTML"
+                )
+
+                ctx = dp.fsm.get_context(
+                    bot, character_id=target_id, user_id=target_id
+                )
+                await ctx.set_state(AdminApp.step2)
+
+                await message.answer("? Keyingi shart foydalanuvchiga yuborildi!")
+            else:
+                await message.answer("Foydalanuvchi allaqachon keyingi bosqichda.")
+        except Exception as e:
+            await message.answer(f"Xatolik yuz berdi: {e}")
+
+
+# ADMIN REPLY: /aniqmas
+@router.message(F.reply_to_message, F.text == "/aniqmas")
+async def admin_reject(message: Message):
+    if not is_system_admin(message.from_user.id):
+        return
+
+    reply_text = message.reply_to_message.text or ""
+    if "ID:" in reply_text:
+        try:
+            target_id = int(reply_text.split("ID:")[1].split()[0].replace("</code>", "").strip())
+            await bot.send_message(
+                target_id, "Siz hali chatga 5 ta odam qo'shmadingiz."
+            )
+            await message.answer("Foydalanuvchiga rad etish xabari yuborildi!")
+        except Exception as e:
+            await message.answer(f"Xatolik yuz berdi: {e}")
+
+
+# 2-shart bajarilganda
+@router.message(AdminApp.step2, F.text == "2-shartni bajardim ??")
+async def process_step2(message: Message, state: FSMContext):
+    user = message.from_user
+
+    cursor.execute("SELECT user_id FROM system_admins")
+    sys_admins = cursor.fetchall()
+    admin_msg = (
+        f"?? <b>2-shart bajarildi:</b>\n"
+        f"Foydalanuvchi: {user.full_name}\n"
+        f"?? ID: <code>{user.id}</code>\n"
+        f"@nazorat1091_bot ga qo'shilganini bildirdi."
+    )
+
+    for sys_admin in sys_admins:
+        try:
+            await bot.send_message(sys_admin[0], admin_msg, parse_mode="HTML")
+        except Exception:
+            pass
+
+    await state.set_state(AdminApp.final_message)
+    await message.answer(
+        "Kanal bosh adminiga nima xabar yozmoqchisiz? Xabaringizni yozib yuboring:",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+# Yakuniy xabar
+@router.message(AdminApp.final_message)
+async def process_final_message(message: Message, state: FSMContext):
+    user = message.from_user
+    user_msg = message.text
+
+    cursor.execute("SELECT user_id FROM system_admins")
+    sys_admins = cursor.fetchall()
+
+    final_admin_msg = (
+        f"?? <b>Nomzoddan xabar:</b>\n\n"
+        f"?? Kimdan: {user.full_name}\n"
+        f"?? ID: <code>{user.id}</code>\n"
+        f"?? Xabar: {user_msg}"
+    )
+
+    for sys_admin in sys_admins:
+        try:
+            await bot.send_message(
+                sys_admin[0], final_admin_msg, parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+    await state.clear()
+    await message.answer(
+        "Xabaringiz adminga yetkazildi! Tez orada siz bilan bog'lanishadi."
+    )
+
+
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
